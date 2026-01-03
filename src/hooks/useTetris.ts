@@ -59,17 +59,35 @@ const TETROMINOES: Record<TetrominoType, number[][]> = {
 
 const TETROMINO_TYPES: TetrominoType[] = ['I', 'O', 'T', 'S', 'Z', 'J', 'L'];
 
+// Level themes (hue values for HSL)
+export const LEVEL_THEMES = [
+  { hue: 180, name: 'Cyan Ocean' },      // 1-5
+  { hue: 280, name: 'Purple Nebula' },   // 6-10
+  { hue: 120, name: 'Green Matrix' },    // 11-15
+  { hue: 30, name: 'Orange Sunset' },    // 16-20
+  { hue: 340, name: 'Pink Neon' },       // 21-25
+  { hue: 200, name: 'Blue Electric' },   // 26-30
+  { hue: 60, name: 'Gold Rush' },        // 31-35
+  { hue: 0, name: 'Red Fury' },          // 36+
+];
+
+export const getThemeForLevel = (level: number) => {
+  const themeIndex = Math.min(Math.floor((level - 1) / 5), LEVEL_THEMES.length - 1);
+  return LEVEL_THEMES[themeIndex];
+};
+
 const createEmptyBoard = (): Board => {
   return Array(BOARD_HEIGHT).fill(null).map(() => Array(BOARD_WIDTH).fill(null));
 };
 
-const getRandomTetromino = (): Tetromino => {
-  const type = TETROMINO_TYPES[Math.floor(Math.random() * TETROMINO_TYPES.length)];
-  return {
-    type,
-    shape: TETROMINOES[type].map(row => [...row]),
-    position: { x: Math.floor((BOARD_WIDTH - TETROMINOES[type][0].length) / 2), y: 0 },
-  };
+// 7-bag randomizer for fair piece distribution
+const createBag = (): TetrominoType[] => {
+  const bag = [...TETROMINO_TYPES];
+  for (let i = bag.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [bag[i], bag[j]] = [bag[j], bag[i]];
+  }
+  return bag;
 };
 
 const rotateMatrix = (matrix: number[][]): number[][] => {
@@ -84,18 +102,47 @@ export const useTetris = () => {
   const [board, setBoard] = useState<Board>(createEmptyBoard);
   const [currentPiece, setCurrentPiece] = useState<Tetromino | null>(null);
   const [nextPiece, setNextPiece] = useState<Tetromino | null>(null);
+  const [holdPiece, setHoldPiece] = useState<TetrominoType | null>(null);
+  const [canHold, setCanHold] = useState(true);
   const [score, setScore] = useState(0);
   const [lines, setLines] = useState(0);
   const [level, setLevel] = useState(1);
+  const [combo, setCombo] = useState(0);
   const [gameOver, setGameOver] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [clearingLines, setClearingLines] = useState<number[]>([]);
+  const [lastClearWasTetris, setLastClearWasTetris] = useState(false);
+  const [showCombo, setShowCombo] = useState(false);
+  const [showLevelUp, setShowLevelUp] = useState(false);
+  const [screenShake, setScreenShake] = useState(false);
+  const [scorePop, setScorePop] = useState(false);
   
+  const bagRef = useRef<TetrominoType[]>([]);
   const gameLoopRef = useRef<number | null>(null);
+  const lastMoveTimeRef = useRef<number>(0);
+
+  const getNextFromBag = useCallback((): TetrominoType => {
+    if (bagRef.current.length === 0) {
+      bagRef.current = createBag();
+    }
+    return bagRef.current.pop()!;
+  }, []);
+
+  const createPiece = useCallback((type: TetrominoType): Tetromino => {
+    return {
+      type,
+      shape: TETROMINOES[type].map(row => [...row]),
+      position: { x: Math.floor((BOARD_WIDTH - TETROMINOES[type][0].length) / 2), y: 0 },
+    };
+  }, []);
 
   const getDropSpeed = useCallback(() => {
-    return Math.max(100, 1000 - (level - 1) * 100);
+    // More aggressive speed curve
+    const baseSpeed = 800;
+    const minSpeed = 50;
+    const speedDecrease = Math.pow(0.85, level - 1);
+    return Math.max(minSpeed, baseSpeed * speedDecrease);
   }, [level]);
 
   const isValidMove = useCallback((piece: Tetromino, boardState: Board): boolean => {
@@ -118,6 +165,15 @@ export const useTetris = () => {
     return true;
   }, []);
 
+  // Calculate ghost piece position
+  const getGhostPosition = useCallback((piece: Tetromino, boardState: Board): number => {
+    let ghostY = piece.position.y;
+    while (isValidMove({ ...piece, position: { ...piece.position, y: ghostY + 1 } }, boardState)) {
+      ghostY++;
+    }
+    return ghostY;
+  }, [isValidMove]);
+
   const lockPiece = useCallback((piece: Tetromino, boardState: Board): Board => {
     const newBoard = boardState.map(row => [...row]);
     
@@ -136,7 +192,7 @@ export const useTetris = () => {
     return newBoard;
   }, []);
 
-  const clearLines = useCallback((boardState: Board): { newBoard: Board; linesCleared: number; clearedIndices: number[] } => {
+  const clearFullLines = useCallback((boardState: Board): { newBoard: Board; linesCleared: number; clearedIndices: number[] } => {
     const clearedIndices: number[] = [];
     
     boardState.forEach((row, index) => {
@@ -158,9 +214,23 @@ export const useTetris = () => {
     return { newBoard, linesCleared: clearedIndices.length, clearedIndices };
   }, []);
 
+  const triggerEffects = useCallback((linesCleared: number) => {
+    if (linesCleared > 0) {
+      setScreenShake(true);
+      setScorePop(true);
+      setTimeout(() => setScreenShake(false), 300);
+      setTimeout(() => setScorePop(false), 300);
+      
+      if (linesCleared >= 2) {
+        setShowCombo(true);
+        setTimeout(() => setShowCombo(false), 1000);
+      }
+    }
+  }, []);
+
   const spawnNewPiece = useCallback(() => {
-    const newPiece = nextPiece || getRandomTetromino();
-    const upcomingPiece = getRandomTetromino();
+    const newPiece = nextPiece || createPiece(getNextFromBag());
+    const upcomingPiece = createPiece(getNextFromBag());
     
     if (!isValidMove(newPiece, board)) {
       setGameOver(true);
@@ -170,7 +240,8 @@ export const useTetris = () => {
     
     setCurrentPiece(newPiece);
     setNextPiece(upcomingPiece);
-  }, [board, nextPiece, isValidMove]);
+    setCanHold(true);
+  }, [board, nextPiece, isValidMove, createPiece, getNextFromBag]);
 
   const moveDown = useCallback(() => {
     if (!currentPiece || isPaused || gameOver) return;
@@ -184,35 +255,52 @@ export const useTetris = () => {
       setCurrentPiece(newPiece);
     } else {
       const newBoard = lockPiece(currentPiece, board);
-      const { newBoard: clearedBoard, linesCleared, clearedIndices } = clearLines(newBoard);
+      const { newBoard: clearedBoard, linesCleared, clearedIndices } = clearFullLines(newBoard);
       
       if (clearedIndices.length > 0) {
         setClearingLines(clearedIndices);
+        triggerEffects(linesCleared);
+        
         setTimeout(() => {
           setClearingLines([]);
           setBoard(clearedBoard);
           
-          const points = [0, 100, 300, 500, 800][linesCleared] * level;
+          // Scoring: base + combo bonus + back-to-back tetris bonus
+          const basePoints = [0, 100, 300, 500, 800][linesCleared];
+          const comboBonus = combo * 50 * linesCleared;
+          const backToBackBonus = lastClearWasTetris && linesCleared === 4 ? 400 : 0;
+          const points = (basePoints + comboBonus + backToBackBonus) * level;
+          
           setScore(prev => prev + points);
+          setCombo(prev => prev + 1);
+          setLastClearWasTetris(linesCleared === 4);
+          
           setLines(prev => {
             const newLines = prev + linesCleared;
-            if (Math.floor(newLines / 10) > Math.floor(prev / 10)) {
-              setLevel(l => l + 1);
+            const newLevel = Math.floor(newLines / 10) + 1;
+            if (newLevel > level) {
+              setLevel(newLevel);
+              setShowLevelUp(true);
+              setTimeout(() => setShowLevelUp(false), 1000);
             }
             return newLines;
           });
           
           setCurrentPiece(null);
-        }, 300);
+        }, 400);
       } else {
         setBoard(clearedBoard);
+        setCombo(0);
         setCurrentPiece(null);
       }
     }
-  }, [currentPiece, board, isPaused, gameOver, isValidMove, lockPiece, clearLines, level]);
+  }, [currentPiece, board, isPaused, gameOver, isValidMove, lockPiece, clearFullLines, level, combo, lastClearWasTetris, triggerEffects]);
 
   const moveLeft = useCallback(() => {
     if (!currentPiece || isPaused || gameOver) return;
+    const now = Date.now();
+    if (now - lastMoveTimeRef.current < 50) return;
+    lastMoveTimeRef.current = now;
 
     const newPiece = {
       ...currentPiece,
@@ -226,6 +314,9 @@ export const useTetris = () => {
 
   const moveRight = useCallback(() => {
     if (!currentPiece || isPaused || gameOver) return;
+    const now = Date.now();
+    if (now - lastMoveTimeRef.current < 50) return;
+    lastMoveTimeRef.current = now;
 
     const newPiece = {
       ...currentPiece,
@@ -263,8 +354,8 @@ export const useTetris = () => {
   const hardDrop = useCallback(() => {
     if (!currentPiece || isPaused || gameOver) return;
 
-    let newPiece = { ...currentPiece };
     let dropDistance = 0;
+    let newPiece = { ...currentPiece };
 
     while (isValidMove({ ...newPiece, position: { ...newPiece.position, y: newPiece.position.y + 1 } }, board)) {
       newPiece = { ...newPiece, position: { ...newPiece.position, y: newPiece.position.y + 1 } };
@@ -273,26 +364,47 @@ export const useTetris = () => {
 
     setScore(prev => prev + dropDistance * 2);
     setCurrentPiece(newPiece);
+    setScreenShake(true);
+    setTimeout(() => setScreenShake(false), 150);
     
-    // Immediately lock
     setTimeout(() => moveDown(), 0);
   }, [currentPiece, board, isPaused, gameOver, isValidMove, moveDown]);
 
+  const hold = useCallback(() => {
+    if (!currentPiece || !canHold || isPaused || gameOver) return;
+
+    const currentType = currentPiece.type;
+    
+    if (holdPiece) {
+      setCurrentPiece(createPiece(holdPiece));
+    } else {
+      setCurrentPiece(null);
+    }
+    
+    setHoldPiece(currentType);
+    setCanHold(false);
+  }, [currentPiece, holdPiece, canHold, isPaused, gameOver, createPiece]);
+
   const startGame = useCallback(() => {
+    bagRef.current = createBag();
     setBoard(createEmptyBoard());
     setScore(0);
     setLines(0);
     setLevel(1);
+    setCombo(0);
     setGameOver(false);
     setIsPlaying(true);
     setIsPaused(false);
     setClearingLines([]);
+    setHoldPiece(null);
+    setCanHold(true);
+    setLastClearWasTetris(false);
     
-    const first = getRandomTetromino();
-    const second = getRandomTetromino();
+    const first = createPiece(getNextFromBag());
+    const second = createPiece(getNextFromBag());
     setCurrentPiece(first);
     setNextPiece(second);
-  }, []);
+  }, [createPiece, getNextFromBag]);
 
   const togglePause = useCallback(() => {
     if (!isPlaying || gameOver) return;
@@ -357,12 +469,20 @@ export const useTetris = () => {
         case 'ArrowUp':
         case 'w':
         case 'W':
+        case 'x':
+        case 'X':
           e.preventDefault();
           rotate();
           break;
         case ' ':
           e.preventDefault();
           hardDrop();
+          break;
+        case 'c':
+        case 'C':
+        case 'Shift':
+          e.preventDefault();
+          hold();
           break;
         case 'p':
         case 'P':
@@ -375,10 +495,30 @@ export const useTetris = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isPlaying, moveLeft, moveRight, moveDown, rotate, hardDrop, togglePause, startGame]);
+  }, [isPlaying, moveLeft, moveRight, moveDown, rotate, hardDrop, hold, togglePause, startGame]);
 
-  // Merge current piece onto display board
+  // Merge current piece and ghost onto display board
   const displayBoard = board.map(row => [...row]);
+  const ghostY = currentPiece ? getGhostPosition(currentPiece, board) : 0;
+  
+  // Add ghost piece first (so current piece renders on top)
+  if (currentPiece && ghostY !== currentPiece.position.y) {
+    for (let y = 0; y < currentPiece.shape.length; y++) {
+      for (let x = 0; x < currentPiece.shape[y].length; x++) {
+        if (currentPiece.shape[y][x]) {
+          const boardY = ghostY + y;
+          const boardX = currentPiece.position.x + x;
+          if (boardY >= 0 && boardY < BOARD_HEIGHT && boardX >= 0 && boardX < BOARD_WIDTH) {
+            if (!displayBoard[boardY][boardX]) {
+              displayBoard[boardY][boardX] = `ghost-${currentPiece.type}` as CellValue;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Add current piece
   if (currentPiece) {
     for (let y = 0; y < currentPiece.shape.length; y++) {
       for (let x = 0; x < currentPiece.shape[y].length; x++) {
@@ -397,13 +537,20 @@ export const useTetris = () => {
     board: displayBoard,
     currentPiece,
     nextPiece,
+    holdPiece,
+    canHold,
     score,
     lines,
     level,
+    combo,
     gameOver,
     isPlaying,
     isPaused,
     clearingLines,
+    showCombo,
+    showLevelUp,
+    screenShake,
+    scorePop,
     startGame,
     togglePause,
     moveLeft,
@@ -411,5 +558,6 @@ export const useTetris = () => {
     moveDown,
     rotate,
     hardDrop,
+    hold,
   };
 };
